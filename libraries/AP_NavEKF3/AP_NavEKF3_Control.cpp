@@ -1,16 +1,11 @@
-/// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
-
 #include <AP_HAL/AP_HAL.h>
-
-#if HAL_CPU_CLASS >= HAL_CPU_CLASS_150
 
 #include "AP_NavEKF3.h"
 #include "AP_NavEKF3_core.h"
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_Vehicle/AP_Vehicle.h>
 #include <GCS_MAVLink/GCS.h>
-
-#include <stdio.h>
+#include <AP_GPS/AP_GPS.h>
 
 extern const AP_HAL::HAL& hal;
 
@@ -45,14 +40,16 @@ void NavEKF3_core::controlFilterModes()
 /*
   return effective value for _magCal for this core
  */
-uint8_t NavEKF3_core::effective_magCal(void) const
+NavEKF3_core::MagCal NavEKF3_core::effective_magCal(void) const
 {
-    // if we are on the 2nd core and _magCal is 3 then treat it as
-    // 2. This is a workaround for a mag fusion problem
-    if (frontend->_magCal ==3 && imu_index == 1) {
-        return 2;
+    MagCal magcal = MagCal(frontend->_magCal.get());
+
+    // force use of simple magnetic heading fusion for specified cores
+    if ((magcal != MagCal::EXTERNAL_YAW) && (magcal != MagCal::EXTERNAL_YAW_FALLBACK) && (magcal != MagCal::GSF_YAW) && (frontend->_magMask & core_index)) {
+        return MagCal::NEVER;
     }
-    return frontend->_magCal;
+
+    return magcal;
 }
 
 // Determine if learning of wind and magnetic field will be enabled and set corresponding indexing limits to
@@ -63,8 +60,10 @@ void NavEKF3_core::setWindMagStateLearningMode()
     bool setWindInhibit = (!useAirspeed() && !assume_zero_sideslip()) || onGround || (PV_AidingMode == AID_NONE);
     if (!inhibitWindStates && setWindInhibit) {
         inhibitWindStates = true;
+        updateStateIndexLim();
     } else if (inhibitWindStates && !setWindInhibit) {
         inhibitWindStates = false;
+        updateStateIndexLim();
         // set states and variances
         if (yawAlignComplete && useAirspeed()) {
             // if we have airspeed and a valid heading, set the wind states to the reciprocal of the vehicle heading
@@ -87,7 +86,7 @@ void NavEKF3_core::setWindMagStateLearningMode()
         }
     }
 
-    // determine if the vehicle is manoevring
+    // determine if the vehicle is manoeuvring
     if (accNavMagHoriz > 0.5f) {
         manoeuvring = true;
     } else {
@@ -95,23 +94,25 @@ void NavEKF3_core::setWindMagStateLearningMode()
     }
 
     // Determine if learning of magnetic field states has been requested by the user
-    uint8_t magCal = effective_magCal();
     bool magCalRequested =
-            ((magCal == 0) && inFlight) || // when flying
-            ((magCal == 1) && manoeuvring)  || // when manoeuvring
-            ((magCal == 3) && finalInflightYawInit && finalInflightMagInit) || // when initial in-air yaw and mag field reset is complete
-            (magCal == 4); // all the time
+        ((effectiveMagCal == MagCal::WHEN_FLYING) && inFlight) || // when flying
+        ((effectiveMagCal == MagCal::WHEN_MANOEUVRING) && manoeuvring)  || // when manoeuvring
+        ((effectiveMagCal == MagCal::AFTER_FIRST_CLIMB) && finalInflightYawInit && finalInflightMagInit) || // when initial in-air yaw and mag field reset is complete
+        ((effectiveMagCal == MagCal::EXTERNAL_YAW_FALLBACK) && inFlight) ||
+        (effectiveMagCal == MagCal::ALWAYS); // all the time
 
     // Deny mag calibration request if we aren't using the compass, it has been inhibited by the user,
     // we do not have an absolute position reference or are on the ground (unless explicitly requested by the user)
-    bool magCalDenied = !use_compass() || (magCal == 2) || (onGround && magCal != 4);
+    bool magCalDenied = !use_compass() || (effectiveMagCal == MagCal::NEVER) || (onGround && effectiveMagCal != MagCal::ALWAYS);
 
     // Inhibit the magnetic field calibration if not requested or denied
     bool setMagInhibit = !magCalRequested || magCalDenied;
     if (!inhibitMagStates && setMagInhibit) {
         inhibitMagStates = true;
+        updateStateIndexLim();
     } else if (inhibitMagStates && !setMagInhibit) {
         inhibitMagStates = false;
+        updateStateIndexLim();
         if (magFieldLearned) {
             // if we have already learned the field states, then retain the learned variances
             P[16][16] = earthMagFieldVar.x;
@@ -141,6 +142,8 @@ void NavEKF3_core::setWindMagStateLearningMode()
     if (tiltAlignComplete && inhibitDelVelBiasStates) {
         // activate the states
         inhibitDelVelBiasStates = false;
+        updateStateIndexLim();
+
         // set the initial covariance values
         P[13][13] = sq(ACCEL_BIAS_LIM_SCALER * frontend->_accBiasLim * dtEkfAvg);
         P[14][14] = P[13][13];
@@ -150,6 +153,8 @@ void NavEKF3_core::setWindMagStateLearningMode()
     if (tiltAlignComplete && inhibitDelAngBiasStates) {
         // activate the states
         inhibitDelAngBiasStates = false;
+        updateStateIndexLim();
+
         // set the initial covariance values
         P[10][10] = sq(radians(InitialGyroBiasUncertainty() * dtEkfAvg));
         P[11][11] = P[10][10];
@@ -163,14 +168,27 @@ void NavEKF3_core::setWindMagStateLearningMode()
         finalInflightMagInit = false;
     }
 
-    // Adjust the indexing limits used to address the covariance, states and other EKF arrays to avoid unnecessary operations
-    // if we are not using those states
-    if (inhibitMagStates && inhibitWindStates && inhibitDelVelBiasStates) {
-        stateIndexLim = 12;
-    } else if (inhibitMagStates && !inhibitWindStates) {
-        stateIndexLim = 15;
-    } else if (inhibitWindStates) {
-        stateIndexLim = 21;
+    updateStateIndexLim();
+}
+
+// Adjust the indexing limits used to address the covariance, states and other EKF arrays to avoid unnecessary operations
+// if we are not using those states
+void NavEKF3_core::updateStateIndexLim()
+{
+    if (inhibitWindStates) {
+        if (inhibitMagStates) {
+            if (inhibitDelVelBiasStates) {
+                if (inhibitDelAngBiasStates) {
+                    stateIndexLim = 9;
+                } else {
+                    stateIndexLim = 12;
+                }
+            } else {
+                stateIndexLim = 15;
+            }
+        } else {
+            stateIndexLim = 21;
+        }
     } else {
         stateIndexLim = 23;
     }
@@ -182,106 +200,116 @@ void NavEKF3_core::setAidingMode()
     // Save the previous status so we can detect when it has changed
     PV_AidingModePrev = PV_AidingMode;
 
+    // Check that the gyro bias variance has converged
+    checkGyroCalStatus();
+
     // Determine if we should change aiding mode
-     if (PV_AidingMode == AID_NONE) {
-        // Don't allow filter to start position or velocity aiding until the tilt and yaw alignment is complete
-        // and IMU gyro bias estimates have stabilised
-        bool filterIsStable = tiltAlignComplete && yawAlignComplete && checkGyroCalStatus();
-        // If GPS usage has been prohiited then we use flow aiding provided optical flow data is present
-        // GPS aiding is the preferred option unless excluded by the user
-        bool canUseGPS = ((frontend->_fusionModeGPS) != 3 && readyToUseGPS() && filterIsStable && !gpsInhibit);
-        bool canUseRangeBeacon = readyToUseRangeBeacon() && filterIsStable;
-        if(canUseGPS || canUseRangeBeacon) {
-            PV_AidingMode = AID_ABSOLUTE;
-        } else if (optFlowDataPresent() && filterIsStable) {
-            PV_AidingMode = AID_RELATIVE;
+    switch (PV_AidingMode) {
+        case AID_NONE: {
+            // Don't allow filter to start position or velocity aiding until the tilt and yaw alignment is complete
+            // and IMU gyro bias estimates have stabilised
+            // If GPS usage has been prohiited then we use flow aiding provided optical flow data is present
+            // GPS aiding is the preferred option unless excluded by the user
+            if (readyToUseGPS() || readyToUseRangeBeacon() || readyToUseExtNav()) {
+                PV_AidingMode = AID_ABSOLUTE;
+            } else if ((readyToUseOptFlow()  && (frontend->_flowUse == FLOW_USE_NAV)) || readyToUseBodyOdm()) {
+                PV_AidingMode = AID_RELATIVE;
+            }
+            break;
         }
-    } else if (PV_AidingMode == AID_RELATIVE) {
-         // Check if the optical flow sensor has timed out
-         bool flowSensorTimeout = ((imuSampleTime_ms - flowValidMeaTime_ms) > 5000);
-         // Check if the fusion has timed out (flow measurements have been rejected for too long)
-         bool flowFusionTimeout = ((imuSampleTime_ms - prevFlowFuseTime_ms) > 5000);
-         // Enable switch to absolute position mode if GPS is available
-         // If GPS is not available and flow fusion has timed out, then fall-back to no-aiding
-         if((frontend->_fusionModeGPS) != 3 && readyToUseGPS() && !gpsInhibit) {
-             PV_AidingMode = AID_ABSOLUTE;
-         } else if (flowSensorTimeout || flowFusionTimeout) {
-             PV_AidingMode = AID_NONE;
-         }
-     } else if (PV_AidingMode == AID_ABSOLUTE) {
-         // Find the minimum time without data required to trigger any check
-         uint16_t minTestTime_ms = MIN(frontend->tiltDriftTimeMax_ms, MIN(frontend->posRetryTimeNoVel_ms,frontend->posRetryTimeUseVel_ms));
+        case AID_RELATIVE: {
+            // Check if the fusion has timed out (flow measurements have been rejected for too long)
+            bool flowFusionTimeout = ((imuSampleTime_ms - prevFlowFuseTime_ms) > 5000);
+            // Check if the fusion has timed out (body odometry measurements have been rejected for too long)
+            bool bodyOdmFusionTimeout = ((imuSampleTime_ms - prevBodyVelFuseTime_ms) > 5000);
+            // Enable switch to absolute position mode if GPS or range beacon data is available
+            // If GPS or range beacons data is not available and flow fusion has timed out, then fall-back to no-aiding
+            if(readyToUseGPS() || readyToUseRangeBeacon()) {
+                PV_AidingMode = AID_ABSOLUTE;
+            } else if (flowFusionTimeout && bodyOdmFusionTimeout) {
+                PV_AidingMode = AID_NONE;
+            }
+            break;
+        }
+        case AID_ABSOLUTE: {
+            // Find the minimum time without data required to trigger any check
+            uint16_t minTestTime_ms = MIN(frontend->tiltDriftTimeMax_ms, MIN(frontend->posRetryTimeNoVel_ms,frontend->posRetryTimeUseVel_ms));
 
-         // Check if optical flow data is being used
-         bool optFlowUsed = (imuSampleTime_ms - prevFlowFuseTime_ms <= minTestTime_ms);
+            // Check if optical flow data is being used
+            bool optFlowUsed = (imuSampleTime_ms - prevFlowFuseTime_ms <= minTestTime_ms);
 
-         // Check if airspeed data is being used
-         bool airSpdUsed = (imuSampleTime_ms - lastTasPassTime_ms <= minTestTime_ms);
+            // Check if body odometry data is being used
+            bool bodyOdmUsed = (imuSampleTime_ms - prevBodyVelFuseTime_ms <= minTestTime_ms);
 
-         // Check if range beacon data is being used
-         bool rngBcnUsed = (imuSampleTime_ms - lastRngBcnPassTime_ms <= minTestTime_ms);
+            // Check if airspeed data is being used
+            bool airSpdUsed = (imuSampleTime_ms - lastTasPassTime_ms <= minTestTime_ms);
 
-         // Check if GPS is being used
-         bool gpsPosUsed = (imuSampleTime_ms - lastPosPassTime_ms <= minTestTime_ms);
-         bool gpsVelUsed = (imuSampleTime_ms - lastVelPassTime_ms <= minTestTime_ms);
+            // Check if range beacon data is being used
+            bool rngBcnUsed = (imuSampleTime_ms - lastRngBcnPassTime_ms <= minTestTime_ms);
 
-         // Check if attitude drift has been constrained by a measurement source
-         bool attAiding = gpsPosUsed || gpsVelUsed || optFlowUsed || airSpdUsed || rngBcnUsed;
+            // Check if GPS or external nav is being used
+            bool posUsed = (imuSampleTime_ms - lastPosPassTime_ms <= minTestTime_ms);
+            bool gpsVelUsed = (imuSampleTime_ms - lastVelPassTime_ms <= minTestTime_ms);
 
-         // check if velocity drift has been constrained by a measurement source
-         bool velAiding = gpsVelUsed || airSpdUsed || optFlowUsed;
+            // Check if attitude drift has been constrained by a measurement source
+            bool attAiding = posUsed || gpsVelUsed || optFlowUsed || airSpdUsed || rngBcnUsed || bodyOdmUsed;
 
-         // check if position drift has been constrained by a measurement source
-         bool posAiding = gpsPosUsed || rngBcnUsed;
+            // check if velocity drift has been constrained by a measurement source
+            bool velAiding = gpsVelUsed || airSpdUsed || optFlowUsed || bodyOdmUsed;
 
-         // Check if the loss of attitude aiding has become critical
-         bool attAidLossCritical = false;
-         if (!attAiding) {
-             attAidLossCritical = (imuSampleTime_ms - prevFlowFuseTime_ms > frontend->tiltDriftTimeMax_ms) &&
-                    (imuSampleTime_ms - lastTasPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
-                    (imuSampleTime_ms - lastRngBcnPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
-                    (imuSampleTime_ms - lastPosPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
-                    (imuSampleTime_ms - lastVelPassTime_ms > frontend->tiltDriftTimeMax_ms);
-         }
+            // check if position drift has been constrained by a measurement source
+            bool posAiding = posUsed || rngBcnUsed;
 
-         // Check if the loss of position accuracy has become critical
-         bool posAidLossCritical = false;
-         if (!posAiding ) {
-             uint16_t maxLossTime_ms;
-             if (!velAiding) {
-                 maxLossTime_ms = frontend->posRetryTimeNoVel_ms;
-             } else {
-                 maxLossTime_ms = frontend->posRetryTimeUseVel_ms;
-             }
-             posAidLossCritical = (imuSampleTime_ms - lastRngBcnPassTime_ms > maxLossTime_ms) &&
-                    (imuSampleTime_ms - lastPosPassTime_ms > maxLossTime_ms) &&
-                    (imuSampleTime_ms - lastVelPassTime_ms > maxLossTime_ms);
-         }
+            // Check if the loss of attitude aiding has become critical
+            bool attAidLossCritical = false;
+            if (!attAiding) {
+            	attAidLossCritical = (imuSampleTime_ms - prevFlowFuseTime_ms > frontend->tiltDriftTimeMax_ms) &&
+                		(imuSampleTime_ms - lastTasPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
+                        (imuSampleTime_ms - lastRngBcnPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
+                        (imuSampleTime_ms - lastPosPassTime_ms > frontend->tiltDriftTimeMax_ms) &&
+                        (imuSampleTime_ms - lastVelPassTime_ms > frontend->tiltDriftTimeMax_ms);
+            }
 
-         if (attAidLossCritical) {
-             // if the loss of attitude data is critical, then put the filter into a constant position mode
-             PV_AidingMode = AID_NONE;
-             posTimeout = true;
-             velTimeout = true;
-             rngBcnTimeout = true;
-             tasTimeout = true;
-             gpsNotAvailable = true;
-         } else if (posAidLossCritical) {
-             // if the loss of position is critical, declare all sources of position aiding as being timed out
-             posTimeout = true;
-             velTimeout = true;
-             rngBcnTimeout = true;
-             gpsNotAvailable = true;
-         }
+            // Check if the loss of position accuracy has become critical
+            bool posAidLossCritical = false;
+            if (!posAiding ) {
+                uint16_t maxLossTime_ms;
+                if (!velAiding) {
+                    maxLossTime_ms = frontend->posRetryTimeNoVel_ms;
+                } else {
+                    maxLossTime_ms = frontend->posRetryTimeUseVel_ms;
+                }
+                posAidLossCritical = (imuSampleTime_ms - lastRngBcnPassTime_ms > maxLossTime_ms) &&
+                                     (imuSampleTime_ms - lastPosPassTime_ms > maxLossTime_ms);
+            }
 
-     }
+            if (attAidLossCritical) {
+                // if the loss of attitude data is critical, then put the filter into a constant position mode
+                PV_AidingMode = AID_NONE;
+                posTimeout = true;
+                velTimeout = true;
+                rngBcnTimeout = true;
+                tasTimeout = true;
+                gpsNotAvailable = true;
+             } else if (posAidLossCritical) {
+                // if the loss of position is critical, declare all sources of position aiding as being timed out
+                posTimeout = true;
+                velTimeout = true;
+                rngBcnTimeout = true;
+                gpsNotAvailable = true;
+
+            }
+            break;
+        }
+    }
 
     // check to see if we are starting or stopping aiding and set states and modes as required
     if (PV_AidingMode != PV_AidingModePrev) {
-        // set various  usage modes based on the condition when we start aiding. These are then held until aiding is stopped.
-        if (PV_AidingMode == AID_NONE) {
+        // set various usage modes based on the condition when we start aiding. These are then held until aiding is stopped.
+        switch (PV_AidingMode) {
+        case AID_NONE:
             // We have ceased aiding
-            GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_WARNING, "EKF3 IMU%u has stopped aiding",(unsigned)imu_index);
+            gcs().send_text(MAV_SEVERITY_WARNING, "EKF3 IMU%u stopped aiding",(unsigned)imu_index);
             // When not aiding, estimate orientation & height fusing synthetic constant position and zero velocity measurement to constrain tilt errors
             posTimeout = true;
             velTimeout = true;
@@ -296,34 +324,61 @@ void NavEKF3_core::setAidingMode()
             meaHgtAtTakeOff = baroDataDelayed.hgt;
             // reset the vertical position state to faster recover from baro errors experienced during touchdown
             stateStruct.position.z = -meaHgtAtTakeOff;
-        } else if (PV_AidingMode == AID_RELATIVE) {
-            // We have commenced aiding, but GPS usage has been prohibited so use optical flow only
-            GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u is using optical flow",(unsigned)imu_index);
+            // reset relative aiding sensor fusion activity status
+            flowFusionActive = false;
+            bodyVelFusionActive = false;
+            break;
+
+        case AID_RELATIVE:
+            // We are doing relative position navigation where velocity errors are constrained, but position drift will occur
+            gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u started relative aiding",(unsigned)imu_index);
+            if (readyToUseOptFlow()) {
+                // Reset time stamps
+                flowValidMeaTime_ms = imuSampleTime_ms;
+                prevFlowFuseTime_ms = imuSampleTime_ms;
+            } else if (readyToUseBodyOdm()) {
+                 // Reset time stamps
+                lastbodyVelPassTime_ms = imuSampleTime_ms;
+                prevBodyVelFuseTime_ms = imuSampleTime_ms;
+            }
             posTimeout = true;
             velTimeout = true;
-            // Reset the last valid flow measurement time
-            flowValidMeaTime_ms = imuSampleTime_ms;
-            // Reset the last valid flow fusion time
-            prevFlowFuseTime_ms = imuSampleTime_ms;
-        } else if (PV_AidingMode == AID_ABSOLUTE) {
-            bool canUseGPS = ((frontend->_fusionModeGPS) != 3 && readyToUseGPS() && !gpsInhibit);
-            bool canUseRangeBeacon = readyToUseRangeBeacon();
-            // We have commenced aiding and GPS usage is allowed
-            if (canUseGPS) {
-                GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u is using GPS",(unsigned)imu_index);
+            break;
+
+        case AID_ABSOLUTE:
+            if (readyToUseGPS()) {
+                // We are commencing aiding using GPS - this is the preferred method
+                posResetSource = GPS;
+                velResetSource = GPS;
+                gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u is using GPS",(unsigned)imu_index);
+            } else if (readyToUseRangeBeacon()) {
+                // We are commencing aiding using range beacons
+                posResetSource = RNGBCN;
+                velResetSource = DEFAULT;
+                gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u is using range beacons",(unsigned)imu_index);
+                gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u initial pos NE = %3.1f,%3.1f (m)",(unsigned)imu_index,(double)receiverPos.x,(double)receiverPos.y);
+                gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u initial beacon pos D offset = %3.1f (m)",(unsigned)imu_index,(double)bcnPosOffsetNED.z);
+            } else if (readyToUseExtNav()) {
+                // we are commencing aiding using external nav
+                posResetSource = EXTNAV;
+                velResetSource = DEFAULT;
+                gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u is using external nav data",(unsigned)imu_index);
+                gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u initial pos NED = %3.1f,%3.1f,%3.1f (m)",(unsigned)imu_index,(double)extNavDataDelayed.pos.x,(double)extNavDataDelayed.pos.y,(double)extNavDataDelayed.pos.z);
+                // handle height reset as special case
+                hgtMea = -extNavDataDelayed.pos.z;
+                posDownObsNoise = sq(constrain_float(extNavDataDelayed.posErr, 0.1f, 10.0f));
+                ResetHeight();
             }
+
+            // clear timeout flags as a precaution to avoid triggering any additional transitions
             posTimeout = false;
             velTimeout = false;
-            // We have commenced aiding and range beacon usage is allowed
-            if (canUseRangeBeacon) {
-                GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u is using range beacons",(unsigned)imu_index);
-                GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u initial pos NE = %3.1f,%3.1f (m)",(unsigned)imu_index,(double)receiverPos.x,(double)receiverPos.y);
-                GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u initial beacon pos D offset = %3.1f (m)",(unsigned)imu_index,(double)bcnPosOffset);
-            }
+
             // reset the last fusion accepted times to prevent unwanted activation of timeout logic
             lastPosPassTime_ms = imuSampleTime_ms;
             lastVelPassTime_ms = imuSampleTime_ms;
             lastRngBcnPassTime_ms = imuSampleTime_ms;
+            break;
         }
 
         // Always reset the position and velocity when changing mode
@@ -339,21 +394,21 @@ void NavEKF3_core::setAidingMode()
 void NavEKF3_core::checkAttitudeAlignmentStatus()
 {
     // Check for tilt convergence - used during initial alignment
-    if (norm(P[0][0],P[1][1],P[2][2],P[3][3]) < sq(0.03f) && !tiltAlignComplete) {
-        tiltAlignComplete = true;
-        GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u tilt alignment complete\n",(unsigned)imu_index);
-    }
-
-    // submit yaw and magnetic field reset requests depending on whether we have compass data
-    if (tiltAlignComplete && !yawAlignComplete) {
-        if (use_compass()) {
-            magYawResetRequest = true;
-            gpsYawResetRequest = false;
-        } else {
-            magYawResetRequest = false;
-            gpsYawResetRequest = true;
+    // Once the tilt variances have reduced to equivalent of 3deg uncertainty, re-set the yaw and magnetic field states
+    // and declare the tilt alignment complete
+    if (!tiltAlignComplete) {
+        Vector3f angleErrVarVec = calcRotVecVariances();
+        if ((angleErrVarVec.x + angleErrVarVec.y) < sq(0.05235f)) {
+            tiltAlignComplete = true;
+            gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u tilt alignment complete",(unsigned)imu_index);
         }
     }
+
+    // submit yaw and magnetic field reset request
+    if (!yawAlignComplete && tiltAlignComplete && use_compass()) {
+            magYawResetRequest = true;
+    }
+
 }
 
 // return true if we should use the airspeed sensor
@@ -369,28 +424,65 @@ bool NavEKF3_core::useRngFinder(void) const
     return true;
 }
 
-// return true if optical flow data is available
-bool NavEKF3_core::optFlowDataPresent(void) const
+// return true if the filter is ready to start using optical flow measurements
+bool NavEKF3_core::readyToUseOptFlow(void) const
 {
-    return (imuSampleTime_ms - flowMeaTime_ms < 200);
+    // We need stable roll/pitch angles and gyro bias estimates but do not need the yaw angle aligned to use optical flow
+    return (imuSampleTime_ms - flowMeaTime_ms < 200) && tiltAlignComplete && delAngBiasLearned;
+}
+
+// return true if the filter is ready to start using body frame odometry measurements
+bool NavEKF3_core::readyToUseBodyOdm(void) const
+{
+
+    // Check for fresh visual odometry data that meets the accuracy required for alignment
+    bool visoDataGood = (imuSampleTime_ms - bodyOdmMeasTime_ms < 200) && (bodyOdmDataNew.velErr < 1.0f);
+
+    // Check for fresh wheel encoder data
+    bool wencDataGood = (imuSampleTime_ms - wheelOdmMeasTime_ms < 200);
+
+    // We require stable roll/pitch angles and gyro bias estimates but do not need the yaw angle aligned to use odometry measurements
+    // because they are in a body frame of reference
+    return (visoDataGood || wencDataGood)
+            && tiltAlignComplete
+            && delAngBiasLearned;
 }
 
 // return true if the filter to be ready to use gps
 bool NavEKF3_core::readyToUseGPS(void) const
 {
-    return validOrigin && tiltAlignComplete && yawAlignComplete && gpsGoodToAlign && (frontend->_fusionModeGPS != 3) && gpsDataToFuse;
+    return validOrigin && tiltAlignComplete && yawAlignComplete && delAngBiasLearned && gpsGoodToAlign && (frontend->_fusionModeGPS != 3) && gpsDataToFuse && !gpsInhibit;
 }
 
 // return true if the filter to be ready to use the beacon range measurements
 bool NavEKF3_core::readyToUseRangeBeacon(void) const
 {
-    return tiltAlignComplete && yawAlignComplete && rngBcnGoodToAlign && rngBcnDataToFuse;
+    return tiltAlignComplete && yawAlignComplete && delAngBiasLearned && rngBcnAlignmentCompleted && rngBcnDataToFuse;
+}
+
+// return true if the filter is ready to use external nav data
+bool NavEKF3_core::readyToUseExtNav(void) const
+{
+    return tiltAlignComplete && extNavDataToFuse;
 }
 
 // return true if we should use the compass
 bool NavEKF3_core::use_compass(void) const
 {
-    return _ahrs->get_compass() && _ahrs->get_compass()->use_for_yaw(magSelectIndex) && !allMagSensorsFailed;
+    return effectiveMagCal != MagCal::EXTERNAL_YAW &&
+           effectiveMagCal != MagCal::GSF_YAW &&
+           _ahrs->get_compass() &&
+           _ahrs->get_compass()->use_for_yaw(magSelectIndex) &&
+           !allMagSensorsFailed;
+}
+
+// are we using a yaw source other than the magnetomer?
+bool NavEKF3_core::using_external_yaw(void) const
+{
+    if (effectiveMagCal == MagCal::EXTERNAL_YAW || effectiveMagCal == MagCal::EXTERNAL_YAW_FALLBACK || effectiveMagCal == MagCal::GSF_YAW) {
+        return imuSampleTime_ms - last_gps_yaw_fusion_ms < 5000 || imuSampleTime_ms - lastSynthYawTime_ms < 5000;
+    }
+    return false;
 }
 
 /*
@@ -405,27 +497,37 @@ bool NavEKF3_core::assume_zero_sideslip(void) const
 }
 
 // set the LLH location of the filters NED origin
-bool NavEKF3_core::setOriginLLH(struct Location &loc)
+bool NavEKF3_core::setOriginLLH(const Location &loc)
 {
-    if (PV_AidingMode == AID_ABSOLUTE) {
+    if ((PV_AidingMode == AID_ABSOLUTE) && (frontend->_fusionModeGPS != 3)) {
+        // reject attempt to set origin if GPS is being used
         return false;
     }
     EKF_origin = loc;
+    ekfGpsRefHgt = (double)0.01 * (double)EKF_origin.alt;
     // define Earth rotation vector in the NED navigation frame at the origin
-    calcEarthRateNED(earthRateNED, _ahrs->get_home().lat);
+    calcEarthRateNED(earthRateNED, loc.lat);
     validOrigin = true;
     return true;
 }
 
 // Set the NED origin to be used until the next filter reset
-void NavEKF3_core::setOrigin()
+void NavEKF3_core::setOrigin(const Location &loc)
 {
-    // assume origin at current GPS location (no averaging)
-    EKF_origin = _ahrs->get_gps().location();
+    EKF_origin = loc;
+    // if flying, correct for height change from takeoff so that the origin is at field elevation
+    if (inFlight) {
+        EKF_origin.alt += (int32_t)(100.0f * stateStruct.position.z);
+    }
+    ekfGpsRefHgt = (double)0.01 * (double)EKF_origin.alt;
     // define Earth rotation vector in the NED navigation frame at the origin
-    calcEarthRateNED(earthRateNED, _ahrs->get_home().lat);
+    calcEarthRateNED(earthRateNED, EKF_origin.lat);
     validOrigin = true;
-    GCS_MAVLINK::send_statustext_all(MAV_SEVERITY_INFO, "EKF3 IMU%u Origin set to GPS",(unsigned)imu_index);
+    gcs().send_text(MAV_SEVERITY_INFO, "EKF3 IMU%u origin set",(unsigned)imu_index);
+
+    // put origin in frontend as well to ensure it stays in sync between lanes
+    frontend->common_EKF_origin = EKF_origin;
+    frontend->common_origin_valid = true;
 }
 
 // record a yaw reset event
@@ -437,32 +539,37 @@ void NavEKF3_core::recordYawReset()
     }
 }
 
-// return true and set the class variable true if the delta angle bias has been learned
-bool NavEKF3_core::checkGyroCalStatus(void)
+// set the class variable true if the delta angle bias variances are sufficiently small
+void NavEKF3_core::checkGyroCalStatus(void)
 {
     // check delta angle bias variances
     const float delAngBiasVarMax = sq(radians(0.15f * dtEkfAvg));
-    delAngBiasLearned = (P[10][10] <= delAngBiasVarMax) &&
-                        (P[11][11] <= delAngBiasVarMax) &&
-                        (P[12][12] <= delAngBiasVarMax);
-    return delAngBiasLearned;
+    if (effectiveMagCal == MagCal::GSF_YAW) {
+        // rotate the variances into earth frame and evaluate horizontal terms only as yaw component is poorly observable without a compass
+        // which can make this check fail
+        Vector3f delAngBiasVarVec = Vector3f(P[10][10],P[11][11],P[12][12]);
+        Vector3f temp = prevTnb * delAngBiasVarVec;
+        delAngBiasLearned = (fabsf(temp.x) < delAngBiasVarMax) &&
+                            (fabsf(temp.y) < delAngBiasVarMax);
+    } else {
+        delAngBiasLearned = (P[10][10] <= delAngBiasVarMax) &&
+                            (P[11][11] <= delAngBiasVarMax) &&
+                            (P[12][12] <= delAngBiasVarMax);
+    }
 }
 
 // Commands the EKF to not use GPS.
-// This command must be sent prior to arming
-// This command is forgotten by the EKF each time the vehicle disarms
+// This command must be sent prior to vehicle arming and EKF commencement of GPS usage
 // Returns 0 if command rejected
-// Returns 1 if attitude, vertical velocity and vertical position will be provided
-// Returns 2 if attitude, 3D-velocity, vertical position and relative horizontal position will be provided
+// Returns 1 if command accepted
 uint8_t NavEKF3_core::setInhibitGPS(void)
 {
-    if((PV_AidingMode == AID_ABSOLUTE) && motorsArmed) {
+    if((PV_AidingMode == AID_ABSOLUTE) || motorsArmed) {
         return 0;
     } else {
         gpsInhibit = true;
         return 1;
     }
-    // option 2 is not yet implemented as it requires a deeper integration of optical flow and GPS operation
 }
 
 // Update the filter status
@@ -470,14 +577,14 @@ void  NavEKF3_core::updateFilterStatus(void)
 {
     // init return value
     filterStatus.value = 0;
-    bool doingFlowNav = (PV_AidingMode == AID_RELATIVE) && flowDataValid;
+    bool doingBodyVelNav = (PV_AidingMode != AID_NONE) && (imuSampleTime_ms - prevBodyVelFuseTime_ms < 5000);
+    bool doingFlowNav = (PV_AidingMode != AID_NONE) && flowDataValid;
     bool doingWindRelNav = !tasTimeout && assume_zero_sideslip();
     bool doingNormalGpsNav = !posTimeout && (PV_AidingMode == AID_ABSOLUTE);
-    bool someVertRefData = (!velTimeout && useGpsVertVel) || !hgtTimeout;
-    bool someHorizRefData = !(velTimeout && posTimeout && tasTimeout) || doingFlowNav;
-    bool optFlowNavPossible = flowDataValid && delAngBiasLearned;
-    bool gpsNavPossible = !gpsNotAvailable && gpsGoodToAlign && delAngBiasLearned;
-    bool filterHealthy = healthy() && tiltAlignComplete && (yawAlignComplete || (!use_compass() && (PV_AidingMode == AID_NONE)));
+    bool someVertRefData = (!velTimeout && (useGpsVertVel || useExtNavVel)) || !hgtTimeout;
+    bool someHorizRefData = !(velTimeout && posTimeout && tasTimeout) || doingFlowNav || doingBodyVelNav;
+    bool filterHealthy = healthy() && tiltAlignComplete && (yawAlignComplete || (!use_compass() && (PV_AidingMode != AID_ABSOLUTE)));
+
     // If GPS height usage is specified, height is considered to be inaccurate until the GPS passes all checks
     bool hgtNotAccurate = (frontend->_altSource == 2) && !validOrigin;
 
@@ -485,18 +592,59 @@ void  NavEKF3_core::updateFilterStatus(void)
     filterStatus.flags.attitude = !stateStruct.quat.is_nan() && filterHealthy;   // attitude valid (we need a better check)
     filterStatus.flags.horiz_vel = someHorizRefData && filterHealthy;      // horizontal velocity estimate valid
     filterStatus.flags.vert_vel = someVertRefData && filterHealthy;        // vertical velocity estimate valid
-    filterStatus.flags.horiz_pos_rel = ((doingFlowNav && gndOffsetValid) || doingWindRelNav || doingNormalGpsNav) && filterHealthy;   // relative horizontal position estimate valid
+    filterStatus.flags.horiz_pos_rel = ((doingFlowNav && gndOffsetValid) || doingWindRelNav || doingNormalGpsNav || doingBodyVelNav) && filterHealthy;   // relative horizontal position estimate valid
     filterStatus.flags.horiz_pos_abs = doingNormalGpsNav && filterHealthy; // absolute horizontal position estimate valid
     filterStatus.flags.vert_pos = !hgtTimeout && filterHealthy && !hgtNotAccurate; // vertical position estimate valid
     filterStatus.flags.terrain_alt = gndOffsetValid && filterHealthy;		// terrain height estimate valid
     filterStatus.flags.const_pos_mode = (PV_AidingMode == AID_NONE) && filterHealthy;     // constant position mode
-    filterStatus.flags.pred_horiz_pos_rel = ((optFlowNavPossible || gpsNavPossible) && filterHealthy) || filterStatus.flags.horiz_pos_rel; // we should be able to estimate a relative position when we enter flight mode
-    filterStatus.flags.pred_horiz_pos_abs = (gpsNavPossible && filterHealthy) || filterStatus.flags.horiz_pos_abs; // we should be able to estimate an absolute position when we enter flight mode
+    filterStatus.flags.pred_horiz_pos_rel = filterStatus.flags.horiz_pos_rel; // EKF3 enters the required mode before flight
+    filterStatus.flags.pred_horiz_pos_abs = filterStatus.flags.horiz_pos_abs; // EKF3 enters the required mode before flight
     filterStatus.flags.takeoff_detected = takeOffDetected; // takeoff for optical flow navigation has been detected
     filterStatus.flags.takeoff = expectGndEffectTakeoff; // The EKF has been told to expect takeoff and is in a ground effect mitigation mode
     filterStatus.flags.touchdown = expectGndEffectTouchdown; // The EKF has been told to detect touchdown and is in a ground effect mitigation mode
     filterStatus.flags.using_gps = ((imuSampleTime_ms - lastPosPassTime_ms) < 4000) && (PV_AidingMode == AID_ABSOLUTE);
-    filterStatus.flags.gps_glitching = !gpsAccuracyGood && (PV_AidingMode == AID_ABSOLUTE); // The GPS is glitching
+    filterStatus.flags.gps_glitching = !gpsAccuracyGood && (PV_AidingMode == AID_ABSOLUTE) && (frontend->_fusionModeGPS != 3); // GPS glitching is affecting navigation accuracy
+    filterStatus.flags.gps_quality_good = gpsGoodToAlign;
+    filterStatus.flags.initalized = filterStatus.flags.initalized || healthy();
 }
 
-#endif // HAL_CPU_CLASS
+void NavEKF3_core::runYawEstimatorPrediction()
+{
+    if (yawEstimator != nullptr && frontend->_fusionModeGPS <= 1) {
+        float trueAirspeed;
+        if (is_positive(defaultAirSpeed) && assume_zero_sideslip()) {
+            if (imuDataDelayed.time_ms - tasDataDelayed.time_ms < 5000) {
+                trueAirspeed = tasDataDelayed.tas;
+            } else {
+                trueAirspeed = defaultAirSpeed * AP::ahrs().get_EAS2TAS();
+            }
+        } else {
+            trueAirspeed = 0.0f;
+        }
+
+        yawEstimator->update(imuDataDelayed.delAng, imuDataDelayed.delVel, imuDataDelayed.delAngDT, imuDataDelayed.delVelDT, EKFGSF_run_filterbank, trueAirspeed);
+    }
+}
+
+void NavEKF3_core::runYawEstimatorCorrection()
+{
+    if (yawEstimator != nullptr && frontend->_fusionModeGPS <= 1) {
+        if (gpsDataToFuse) {
+            Vector2f gpsVelNE = Vector2f(gpsDataDelayed.vel.x, gpsDataDelayed.vel.y);
+            float gpsVelAcc = fmaxf(gpsSpdAccuracy, frontend->_gpsHorizVelNoise);
+            yawEstimator->pushVelData(gpsVelNE, gpsVelAcc);
+        }
+
+        // action an external reset request
+        if (EKFGSF_yaw_reset_request_ms > 0 && imuSampleTime_ms - EKFGSF_yaw_reset_request_ms < YAW_RESET_TO_GSF_TIMEOUT_MS) {
+            EKFGSF_resetMainFilterYaw();
+        }
+    }
+}
+
+// request a reset the yaw to the GSF estimate
+// request times out after YAW_RESET_TO_GSF_TIMEOUT_MS if it cannot be actioned
+void NavEKF3_core::EKFGSF_requestYawReset()
+{
+    EKFGSF_yaw_reset_request_ms = imuSampleTime_ms;
+}
